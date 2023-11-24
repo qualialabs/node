@@ -1,3 +1,4 @@
+import fs from 'fs/promises';
 import * as common from '../common/index.mjs';
 import * as fixtures from '../common/fixtures.mjs';
 import tmpdir from '../common/tmpdir.js';
@@ -34,6 +35,8 @@ async function spawnWithRestarts({
   watchedFile = file,
   restarts = 1,
   isReady,
+  spawnOptions,
+  returnChild = false
 }) {
   args ??= [file];
   const printedArgs = inspect(args.slice(args.indexOf(file)).join(' '));
@@ -44,30 +47,36 @@ async function spawnWithRestarts({
   let cancelRestarts;
 
   disableRestart = true;
-  const child = spawn(execPath, ['--watch', '--no-warnings', ...args], { encoding: 'utf8' });
-  child.stderr.on('data', (data) => {
-    stderr += data;
-  });
-  child.stdout.on('data', async (data) => {
-    if (data.toString().includes('Restarting')) {
-      disableRestart = true;
-    }
-    stdout += data;
-    const restartsCount = stdout.match(new RegExp(`Restarting ${printedArgs.replace(/\\/g, '\\\\')}`, 'g'))?.length ?? 0;
-    if (restarts === 0 || !isReady(data.toString())) {
-      return;
-    }
-    if (restartsCount >= restarts) {
-      cancelRestarts?.();
-      child.kill();
-      return;
-    }
-    cancelRestarts ??= restart(watchedFile);
-    if (isReady(data.toString())) {
-      disableRestart = false;
-    }
-  });
+  const child = spawn(execPath, ['--watch', '--no-warnings', ...args], { encoding: 'utf8', ...spawnOptions });
 
+  if (!returnChild) {
+    child.stderr.on('data', (data) => {
+      stderr += data;
+    });
+    child.stdout.on('data', async (data) => {
+      if (data.toString().includes('Restarting')) {
+        disableRestart = true;
+      }
+      stdout += data;
+      const restartsCount = stdout.match(new RegExp(`Restarting ${printedArgs.replace(/\\/g, '\\\\')}`, 'g'))?.length ?? 0;
+      if (restarts === 0 || !isReady(data.toString())) {
+        return;
+      }
+      if (restartsCount >= restarts) {
+        cancelRestarts?.();
+        child.kill();
+        return;
+      }
+      cancelRestarts ??= restart(watchedFile);
+      if (isReady(data.toString())) {
+        disableRestart = false;
+      }
+    });
+  }
+  else {
+    // this test is doing it's own thing
+    return { child };
+  }
   await once(child, 'exit');
   cancelRestarts?.();
   return { stderr, stdout };
@@ -248,6 +257,7 @@ describe('watch mode', { concurrency: false, timeout: 60_000 }, () => {
     });
   });
 
+
   // TODO: Remove skip after https://github.com/nodejs/node/pull/45271 lands
   it('should not watch when running an missing file', {
     skip: !supportsRecursive
@@ -304,6 +314,72 @@ describe('watch mode', { concurrency: false, timeout: 60_000 }, () => {
     const lines = stdout.split(/\r?\n/).filter(Boolean).slice(3);
     assert.deepStrictEqual(lines, [
       'running',
+      `Completed running ${inspect(file)}`,
+    ]);
+  });
+
+  it('should pass IPC messages from a spawning parent to the child and back', async () => {
+    const file = createTmpFile('console.log("running");\nprocess.on("message", (message) => {\n  if (message === "exit") {\n    process.exit(0);\n  } else {\n    console.log("Received:", message);\n    process.send(message);\n  }\n})');
+    const { child } = await spawnWithRestarts({
+      file,
+      args: [file],
+      spawnOptions: {
+        stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
+      },
+      returnChild: true,
+      restarts: 2
+    });
+
+    let stderr = '';
+    let stdout = '';
+
+    child.stdout.on("data", data => stdout += data);
+    child.stderr.on("data", data => stderr += data);
+    async function waitForEcho(msg) {
+      const receivedPromise = new Promise((resolve) => {
+        const fn = (message) => {
+          if (message === msg) {
+            child.off("message", fn);
+            resolve();
+          }
+        };
+        child.on("message", fn);
+      });
+      child.send(msg);
+      await receivedPromise;
+    }
+    async function waitForText(text) {
+      const seenPromise = new Promise((resolve) => {
+        const fn = (data) => {
+          if (data.toString().includes(text)) {
+            resolve();
+            child.stdout.off("data", fn);
+          }
+        }
+        child.stdout.on("data", fn);
+      });
+      await seenPromise;
+    }
+
+    await waitForEcho("first message");
+    const stopRestarts = restart(file);
+    await waitForText("running");
+    stopRestarts();
+    await waitForEcho("second message");
+    const exitedPromise = once(child, 'exit');
+    child.send("exit");
+    await waitForText("Completed");
+    child.disconnect();
+    child.kill();
+    await exitedPromise;
+    assert.strictEqual(stderr, '');
+    const lines = stdout.split(/\r?\n/).filter(Boolean);
+    assert.deepStrictEqual(lines, [
+      'running',
+      'Received: first message',
+      `Restarting '${file}'`,
+      'running',
+      'Received: second message',
       `Completed running ${inspect(file)}`,
     ]);
   });
