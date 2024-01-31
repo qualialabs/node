@@ -283,7 +283,7 @@ console.log(values.random);
     const args = ['--import', imported, file];
     const { stdout, pid } = await runWriteSucceed({ file, watchedFile: file, args });
 
-    const importPid = parseInt(stdout[0].split(' ')[1], 10);
+    const importPid = parseInt(stdout[0]?.split(' ')[1], 10);
     assert.notStrictEqual(pid, importPid);
     assert.deepStrictEqual(stdout, [
       'running',
@@ -432,7 +432,7 @@ process.on('message', (message) => {
     assert.deepStrictEqual(lines, [
       'running',
       'Received: first message',
-      `Restarting '${file}'`,
+      `Restarting '${inspect(file)}'`,
       'running',
       'Received: second message',
       `Completed running ${inspect(file)}`,
