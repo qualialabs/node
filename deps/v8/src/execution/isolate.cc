@@ -622,9 +622,12 @@ void Isolate::Iterate(RootVisitor* v, ThreadLocalTop* thread) {
         FullObjectSlot(reinterpret_cast<Address>(&(block->message_obj_))));
   }
 
-  v->VisitRootPointer(
-      Root::kStackRoots, nullptr,
-      FullObjectSlot(continuation_preserved_embedder_data_address()));
+  // Qualia: continuation_preserved_embedder_data_ lives in IsolateData, not in
+  // ThreadLocalTop, so it is visited once from Iterate(RootVisitor*) below
+  // instead of once per archived thread here. Visiting the same root slot more
+  // than once per GC is not safe: the scavenger would copy a young object a
+  // second time from its to-space copy (node-fibers archives a thread state per
+  // coroutine via Locker/Unlocker, which made this reachable).
 
   // Iterate over pointers on native execution stack.
 #if V8_ENABLE_WEBASSEMBLY
@@ -648,6 +651,9 @@ void Isolate::Iterate(RootVisitor* v, ThreadLocalTop* thread) {
 }
 
 void Isolate::Iterate(RootVisitor* v) {
+  v->VisitRootPointer(
+      Root::kStackRoots, nullptr,
+      FullObjectSlot(continuation_preserved_embedder_data_address()));
   ThreadLocalTop* current_t = thread_local_top();
   Iterate(v, current_t);
 }
