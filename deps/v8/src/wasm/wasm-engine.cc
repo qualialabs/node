@@ -103,18 +103,6 @@ class LogCodesTask : public Task {
   WasmEngine* const engine_;
 };
 
-void CheckNoArchivedThreads(Isolate* isolate) {
-  class ArchivedThreadsVisitor : public ThreadVisitor {
-    void VisitThread(Isolate* isolate, ThreadLocalTop* top) override {
-      // Archived threads are rarely used, and not combined with Wasm at the
-      // moment. Implement this and test it properly once we have a use case for
-      // that.
-      FATAL("archived threads in combination with wasm not supported");
-    }
-  } archived_threads_visitor;
-  isolate->thread_manager()->IterateArchivedThreads(&archived_threads_visitor);
-}
-
 class WasmGCForegroundTask : public CancelableTask {
  public:
   explicit WasmGCForegroundTask(Isolate* isolate)
@@ -1382,6 +1370,26 @@ void ReportLiveCodeFromFrameForGC(
     }
 #endif
 }
+
+// Qualia (node-fibers): every suspended fiber is a Locker-archived thread whose JS stack may
+// hold live wasm frames. Upstream refuses to run wasm code GC in that situation
+// (FATAL "archived threads in combination with wasm not supported"); instead, report the live
+// code from each archived thread's frames, exactly as the GC root visitor walks them in
+// Isolate::Iterate(RootVisitor*, ThreadLocalTop*).
+class ArchivedThreadsLiveCodeVisitor : public ThreadVisitor {
+ public:
+  explicit ArchivedThreadsLiveCodeVisitor(
+      std::unordered_set<wasm::WasmCode*>& live_wasm_code)
+      : live_wasm_code_(live_wasm_code) {}
+  void VisitThread(Isolate* isolate, ThreadLocalTop* top) override {
+    for (StackFrameIterator it(isolate, top); !it.done(); it.Advance()) {
+      ReportLiveCodeFromFrameForGC(it.frame(), live_wasm_code_);
+    }
+  }
+
+ private:
+  std::unordered_set<wasm::WasmCode*>& live_wasm_code_;
+};
 }  // namespace
 
 void WasmEngine::ReportLiveCodeFromStackForGC(Isolate* isolate) {
@@ -1409,7 +1417,11 @@ void WasmEngine::ReportLiveCodeFromStackForGC(Isolate* isolate) {
     ReportLiveCodeFromFrameForGC(frame, live_wasm_code);
   }
 
-  CheckNoArchivedThreads(isolate);
+  {
+    ArchivedThreadsLiveCodeVisitor archived_threads_visitor(live_wasm_code);
+    isolate->thread_manager()->IterateArchivedThreads(
+        &archived_threads_visitor);
+  }
 
   ReportLiveCodeForGC(
       isolate, base::OwnedVector<WasmCode*>::Of(live_wasm_code).as_vector());
