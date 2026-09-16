@@ -19,6 +19,10 @@ thread_local void* thread_stack_start = nullptr;
 // cppgc, which would otherwise walk from a coroutine stack up to the thread's
 // stack start through unmapped memory.
 thread_local void* thread_stack_start_override = nullptr;
+// Set once the embedder has used the override at all. Consumers that cache the stack start
+// (the conservative stack scan) re-read it per scan when this is set, because a coroutine
+// switch can happen under a held Locker without Isolate::Enter() running again.
+bool thread_stack_start_override_enabled = false;
 
 }  // namespace
 
@@ -45,6 +49,12 @@ Stack::StackSlot Stack::GetStackStart() { return GetStackStartUnchecked(); }
 extern "C" __attribute__((visibility("default"))) void
 v8_qualia_set_thread_stack_start(void* stack_start) {
   v8::base::thread_stack_start_override = stack_start;
+  v8::base::thread_stack_start_override_enabled = true;
+}
+
+extern "C" __attribute__((visibility("default"))) bool
+v8_qualia_thread_stack_start_override_enabled() {
+  return v8::base::thread_stack_start_override_enabled;
 }
 
 namespace v8 {

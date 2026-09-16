@@ -11,6 +11,9 @@
 #include "src/base/sanitizer/tsan.h"
 #include "src/heap/base/memory-tagging.h"
 
+// Qualia (node-fibers): defined in src/base/platform/platform.cc.
+extern "C" bool v8_qualia_thread_stack_start_override_enabled();
+
 namespace heap::base {
 
 // Function with architecture-specific implementation:
@@ -163,8 +166,16 @@ void Stack::IteratePointersUntilMarker(StackVisitor* visitor) const {
   // may not be tagging its portion of the stack, higher frames from the OS or
   // libc could be using stack tagging.)
   SuspendTagCheckingScope s;
-  IteratePointersInStack(visitor, current_segment_);
-  IteratePointersInUnsafeStackIfNecessary(visitor, current_segment_);
+  Segment segment = current_segment_;
+  if (v8_qualia_thread_stack_start_override_enabled()) {
+    // node-fibers switches coroutine stacks under a held Locker without re-entering the
+    // isolate, so the start recorded by Isolate::Enter() may belong to another coroutine's
+    // stack. Re-read it (the override points at the running coroutine's stack top) so the
+    // scan stays within the stack the marker was set on.
+    segment.start = v8::base::Stack::GetStackStart();
+  }
+  IteratePointersInStack(visitor, segment);
+  IteratePointersInUnsafeStackIfNecessary(visitor, segment);
   if (scan_simulator_callback_) {
     scan_simulator_callback_(visitor);
   }
