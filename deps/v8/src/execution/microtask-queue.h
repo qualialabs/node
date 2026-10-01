@@ -100,6 +100,22 @@ class V8_EXPORT_PRIVATE MicrotaskQueue final : public v8::MicrotaskQueue {
   intptr_t size() const { return size_; }
   intptr_t start() const { return start_; }
 
+  // Qualia: see v8::MicrotaskQueue::RunState.
+  v8::MicrotaskQueue::RunState GetInternalRunState() const {
+    v8::MicrotaskQueue::RunState state;
+    state.is_running = is_running_microtasks_;
+    state.scope_depth = microtasks_depth_;
+    state.suppressions = microtasks_suppressions_;
+    state.stop_draining = qualia_stop_draining_ != 0;
+    return state;
+  }
+  void SetInternalRunState(const v8::MicrotaskQueue::RunState& state) {
+    is_running_microtasks_ = state.is_running;
+    microtasks_depth_ = state.scope_depth;
+    microtasks_suppressions_ = state.suppressions;
+    qualia_stop_draining_ = state.stop_draining ? 1 : 0;
+  }
+
   Microtask get(intptr_t index) const;
 
   MicrotaskQueue* next() const { return next_; }
@@ -110,6 +126,7 @@ class V8_EXPORT_PRIVATE MicrotaskQueue final : public v8::MicrotaskQueue {
   static const size_t kSizeOffset;
   static const size_t kStartOffset;
   static const size_t kFinishedMicrotaskCountOffset;
+  static const size_t kQualiaStopDrainingOffset;
 
   static const intptr_t kMinimumCapacity;
 
@@ -146,6 +163,9 @@ class V8_EXPORT_PRIVATE MicrotaskQueue final : public v8::MicrotaskQueue {
   v8::MicrotasksPolicy microtasks_policy_ = v8::MicrotasksPolicy::kAuto;
 
   bool is_running_microtasks_ = false;
+
+  // Qualia: checked by the RunMicrotasks builtin before each microtask.
+  intptr_t qualia_stop_draining_ = 0;
   using CallbackWithData =
       std::pair<MicrotasksCompletedCallbackWithData, void*>;
   std::vector<CallbackWithData> microtasks_completed_callbacks_;

@@ -597,6 +597,15 @@ TF_BUILTIN(RunMicrotasks, MicrotaskQueueBuiltinsAssembler) {
   Goto(&loop);
   BIND(&loop);
 
+  // Qualia: exit if this stack was suspended mid-drain and has since been
+  // resumed; another stack took over draining the queue.
+  GotoIf(WordNotEqual(
+             Load<IntPtrT>(microtask_queue,
+                           IntPtrConstant(
+                               MicrotaskQueue::kQualiaStopDrainingOffset)),
+             IntPtrConstant(0)),
+         &done);
+
   TNode<IntPtrT> size = GetMicrotaskQueueSize(microtask_queue);
 
   // Exit if the queue is empty.

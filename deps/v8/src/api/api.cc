@@ -9555,6 +9555,18 @@ std::unique_ptr<MicrotaskQueue> MicrotaskQueue::New(Isolate* isolate,
   return ret;
 }
 
+MicrotaskQueue::RunState MicrotaskQueue::GetRunState() const {
+  return static_cast<const i::MicrotaskQueue*>(this)->GetInternalRunState();
+}
+
+void MicrotaskQueue::SetRunState(const RunState& state) {
+  static_cast<i::MicrotaskQueue*>(this)->SetInternalRunState(state);
+}
+
+size_t MicrotaskQueue::Size() const {
+  return static_cast<size_t>(static_cast<const i::MicrotaskQueue*>(this)->size());
+}
+
 MicrotasksScope::MicrotasksScope(Isolate* isolate, MicrotasksScope::Type type)
     : MicrotasksScope(isolate, nullptr, type) {}
 

@@ -1,6 +1,7 @@
 #include "node.h"
 #include "async_wrap-inl.h"
 #include "env-inl.h"
+#include "node_internals.h"
 #include "v8.h"
 
 namespace node {
@@ -15,6 +16,20 @@ using v8::MaybeLocal;
 using v8::Object;
 using v8::String;
 using v8::Value;
+
+typedef void (*QualiaMicrotaskCheckpointHook)(Isolate* isolate,
+                                              Local<Context> context,
+                                              v8::MicrotaskQueue* queue);
+static QualiaMicrotaskCheckpointHook qualia_microtask_checkpoint_hook = nullptr;
+
+void PerformMicrotaskCheckpoint(Isolate* isolate, Local<Context> context) {
+  v8::MicrotaskQueue* queue = context->GetMicrotaskQueue();
+  if (qualia_microtask_checkpoint_hook != nullptr) {
+    qualia_microtask_checkpoint_hook(isolate, context, queue);
+  } else {
+    queue->PerformCheckpoint(isolate);
+  }
+}
 
 CallbackScope::CallbackScope(Isolate* isolate,
                              Local<Object> object,
@@ -134,7 +149,7 @@ void InternalCallbackScope::Close() {
 
   Local<Context> context = env_->context();
   if (!tick_info->has_tick_scheduled()) {
-    context->GetMicrotaskQueue()->PerformCheckpoint(isolate);
+    PerformMicrotaskCheckpoint(isolate, context);
 
     perform_stopping_check();
   }
@@ -358,3 +373,10 @@ Local<Value> MakeCallback(Isolate* isolate,
 }
 
 }  // namespace node
+
+// Qualia: looked up with dlsym() by node-fibers, so addons still load on a
+// stock node. Passing nullptr restores the default behaviour.
+extern "C" NODE_EXTERN void node_qualia_set_microtask_checkpoint_hook(
+    node::QualiaMicrotaskCheckpointHook hook) {
+  node::qualia_microtask_checkpoint_hook = hook;
+}

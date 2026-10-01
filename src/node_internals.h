@@ -88,6 +88,12 @@ std::string FormatCaughtException(v8::Isolate* isolate,
                                   const v8::TryCatch& try_catch);
 
 void ResetStdio();  // Safe to call more than once and from signal handlers.
+
+// Qualia: drains a context's microtask queue, through the hook registered with
+// node_qualia_set_microtask_checkpoint_hook() if there is one (node-fibers uses
+// it to drain on a fiber, so `await` continuations can Fiber.yield()).
+void PerformMicrotaskCheckpoint(v8::Isolate* isolate,
+                                v8::Local<v8::Context> context);
 #ifdef __POSIX__
 void SignalExit(int signal, siginfo_t* info, void* ucontext);
 #endif
