@@ -2,14 +2,17 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#include "include/v8-microtask-dispatch.h"
 #include "src/api/api-inl.h"
 #include "src/debug/debug.h"
 #include "src/execution/arguments-inl.h"
+#include "src/execution/execution.h"
 #include "src/execution/microtask-queue.h"
 #include "src/logging/counters.h"
 #include "src/objects/elements.h"
 #include "src/objects/heap-object-inl.h"
 #include "src/objects/js-promise-inl.h"
+#include "src/objects/microtask-inl.h"
 #include "src/objects/objects-inl.h"
 #include "src/objects/oddball-inl.h"
 #include "src/runtime/runtime-utils.h"
@@ -103,6 +106,104 @@ RUNTIME_FUNCTION(Runtime_RunMicrotaskCallback) {
   RETURN_FAILURE_IF_SCHEDULED_EXCEPTION(isolate);
   return ReadOnlyRoots(isolate).undefined_value();
 }
+
+// Prototype (Qualia): hand promise reaction jobs that carry continuation-
+// preserved embedder data to the embedder, so it can run them on another
+// stack (node-fibers). See include/v8-microtask-dispatch.h.
+}  // namespace internal
+
+struct DispatchedMicrotask {
+  internal::MicrotaskQueue* queue;
+};
+
+namespace internal {
+
+namespace {
+v8::MicrotaskDispatchCallback g_microtask_dispatch_callback = nullptr;
+void* g_microtask_dispatch_data = nullptr;
+Isolate* g_microtask_dispatch_isolate = nullptr;
+// Set by RunDispatchedMicrotask just before it runs its private queue, so the
+// single job in that queue runs inline instead of being dispatched again.
+bool g_run_next_dispatchable_inline = false;
+}  // namespace
+
+RUNTIME_FUNCTION(Runtime_DispatchMicrotask) {
+  HandleScope scope(isolate);
+  DCHECK_EQ(1, args.length());
+  if (g_run_next_dispatchable_inline) {
+    g_run_next_dispatchable_inline = false;
+    return ReadOnlyRoots(isolate).false_value();
+  }
+  if (g_microtask_dispatch_callback == nullptr ||
+      g_microtask_dispatch_isolate != isolate) {
+    return ReadOnlyRoots(isolate).false_value();
+  }
+  Handle<Microtask> microtask = args.at<Microtask>(0);
+  // A private single-job queue keeps the job alive (queues are GC roots) and
+  // lets RunDispatchedMicrotask reuse the RunMicrotasks builtin.
+  std::unique_ptr<MicrotaskQueue> queue = MicrotaskQueue::New(isolate);
+  queue->EnqueueMicrotask(*microtask);
+  v8::DispatchedMicrotask* task = new v8::DispatchedMicrotask{queue.get()};
+  bool taken = g_microtask_dispatch_callback(
+      reinterpret_cast<v8::Isolate*>(isolate), task, g_microtask_dispatch_data);
+  if (taken) {
+    queue.release();  // Owned (and possibly already freed) by the embedder.
+  } else {
+    delete task;
+  }
+  RETURN_FAILURE_IF_SCHEDULED_EXCEPTION(isolate);
+  return taken ? ReadOnlyRoots(isolate).true_value()
+               : ReadOnlyRoots(isolate).false_value();
+}
+
+}  // namespace internal
+
+void SetMicrotaskDispatchCallback(Isolate* v8_isolate,
+                                  MicrotaskDispatchCallback callback,
+                                  void* data) {
+  internal::g_microtask_dispatch_callback = callback;
+  internal::g_microtask_dispatch_data = data;
+  internal::g_microtask_dispatch_isolate =
+      reinterpret_cast<internal::Isolate*>(v8_isolate);
+}
+
+void RunDispatchedMicrotask(Isolate* v8_isolate, DispatchedMicrotask* task) {
+  internal::Isolate* isolate = reinterpret_cast<internal::Isolate*>(v8_isolate);
+  std::unique_ptr<internal::MicrotaskQueue> queue(task->queue);
+  delete task;
+  internal::HandleScope handle_scope(isolate);
+  internal::MaybeHandle<internal::Object> maybe_exception;
+  internal::MaybeHandle<internal::Object> maybe_result;
+  {
+    internal::HandleScopeImplementer::EnteredContextRewindScope rewind_scope(
+        isolate->handle_scope_implementer());
+    internal::g_run_next_dispatchable_inline = true;
+    maybe_result = internal::Execution::TryRunMicrotasks(isolate, queue.get(),
+                                                         &maybe_exception);
+    // Normally consumed by Runtime_DispatchMicrotask before the job starts.
+    internal::g_run_next_dispatchable_inline = false;
+  }
+  if (maybe_result.is_null() && maybe_exception.is_null()) {
+    isolate->OnTerminationDuringRunMicrotasks();
+  }
+}
+
+}  // namespace v8
+
+extern "C" {
+void v8_qualia_SetMicrotaskDispatchCallback(
+    v8::Isolate* isolate, v8::MicrotaskDispatchCallback callback, void* data) {
+  v8::SetMicrotaskDispatchCallback(isolate, callback, data);
+}
+
+void v8_qualia_RunDispatchedMicrotask(v8::Isolate* isolate,
+                                      v8::DispatchedMicrotask* task) {
+  v8::RunDispatchedMicrotask(isolate, task);
+}
+}
+
+namespace v8 {
+namespace internal {
 
 RUNTIME_FUNCTION(Runtime_PromiseStatus) {
   HandleScope scope(isolate);
