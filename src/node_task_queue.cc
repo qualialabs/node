@@ -172,7 +172,7 @@ static void EnqueueMicrotask(const FunctionCallbackInfo<Value>& args) {
 
 static void RunMicrotasks(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
-  env->context()->GetMicrotaskQueue()->PerformCheckpoint(env->isolate());
+  PerformMicrotaskCheckpoint(env->isolate(), env->context());
 }
 
 static void SetTickCallback(const FunctionCallbackInfo<Value>& args) {

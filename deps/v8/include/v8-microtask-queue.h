@@ -97,6 +97,28 @@ class V8_EXPORT MicrotaskQueue {
    */
   virtual int GetMicrotasksScopeDepth() const = 0;
 
+  /**
+   * Qualia: the bookkeeping that says "a checkpoint is in progress on this
+   * queue". V8 assumes the checkpoint runs to completion on one native stack;
+   * node-fibers can suspend a fiber mid-checkpoint, so it saves and restores
+   * this state per fiber on every switch.
+   */
+  struct RunState {
+    bool is_running = false;
+    int scope_depth = 0;
+    int suppressions = 0;
+    // Set when a fiber is suspended mid-checkpoint: once it resumes, its drain
+    // loop stops after the current microtask (another stack has taken over).
+    bool stop_draining = false;
+  };
+  RunState GetRunState() const;
+  void SetRunState(const RunState& state);
+
+  /**
+   * Qualia: number of microtasks currently queued.
+   */
+  size_t Size() const;
+
   MicrotaskQueue(const MicrotaskQueue&) = delete;
   MicrotaskQueue& operator=(const MicrotaskQueue&) = delete;
 

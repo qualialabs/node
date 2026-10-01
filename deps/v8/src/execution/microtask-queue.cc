@@ -25,6 +25,8 @@ const size_t MicrotaskQueue::kCapacityOffset =
     OFFSET_OF(MicrotaskQueue, capacity_);
 const size_t MicrotaskQueue::kSizeOffset = OFFSET_OF(MicrotaskQueue, size_);
 const size_t MicrotaskQueue::kStartOffset = OFFSET_OF(MicrotaskQueue, start_);
+const size_t MicrotaskQueue::kQualiaStopDrainingOffset =
+    OFFSET_OF(MicrotaskQueue, qualia_stop_draining_);
 const size_t MicrotaskQueue::kFinishedMicrotaskCountOffset =
     OFFSET_OF(MicrotaskQueue, finished_microtask_count_);
 
@@ -174,6 +176,9 @@ int MicrotaskQueue::RunMicrotasks(Isolate* isolate) {
                                                  &maybe_exception);
       processed_microtask_count =
           static_cast<int>(finished_microtask_count_ - base_count);
+      // Qualia: the loop may have stopped early for a resumed fiber; the
+      // stack that took over the drain owns whatever is left.
+      qualia_stop_draining_ = 0;
     }
     TRACE_EVENT_END1("v8.execute", "RunMicrotasks", "microtask_count",
                      processed_microtask_count);
@@ -191,7 +196,6 @@ int MicrotaskQueue::RunMicrotasks(Isolate* isolate) {
     OnCompleted(isolate);
     return -1;
   }
-  DCHECK_EQ(0, size());
   OnCompleted(isolate);
 
   return processed_microtask_count;
