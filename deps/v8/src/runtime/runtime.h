@@ -293,6 +293,7 @@ namespace internal {
   F(PropagateException, 0, 1)                              \
   F(ReportMessageFromMicrotask, 1, 1)                      \
   F(RunMicrotaskCallback, 2, 1)                            \
+  F(DispatchMicrotask, 1, 1)                               \
   F(PerformMicrotaskCheckpoint, 0, 1)                      \
   F(SharedValueBarrierSlow, 1, 1)                          \
   F(StackGuard, 0, 1)                                      \

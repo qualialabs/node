@@ -2,11 +2,15 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#include "include/v8-microtask-dispatch.h"
 #include "src/api/api-inl.h"
 #include "src/debug/debug.h"
 #include "src/execution/arguments-inl.h"
+#include "src/execution/execution.h"
 #include "src/execution/microtask-queue.h"
 #include "src/objects/js-promise-inl.h"
+#include "src/objects/microtask-inl.h"
+#include "src/objects/promise-inl.h"
 
 namespace v8 {
 namespace internal {
@@ -94,6 +98,161 @@ RUNTIME_FUNCTION(Runtime_RunMicrotaskCallback) {
   RETURN_FAILURE_IF_EXCEPTION(isolate);
   return ReadOnlyRoots(isolate).undefined_value();
 }
+
+// Prototype (Qualia): hand promise reaction jobs that carry continuation-
+// preserved embedder data to the embedder, so it can run them on another
+// stack (node-fibers). See include/v8-microtask-dispatch.h.
+}  // namespace internal
+
+struct DispatchedMicrotask {
+  internal::MicrotaskQueue* queue;
+};
+
+namespace internal {
+
+namespace {
+v8::MicrotaskDispatchCallback g_microtask_dispatch_callback = nullptr;
+void* g_microtask_dispatch_data = nullptr;
+Isolate* g_microtask_dispatch_isolate = nullptr;
+// Set just before a private single-job queue runs, so that job runs inline
+// instead of being dispatched again.
+bool g_run_next_dispatchable_inline = false;
+}  // namespace
+
+// Runs the one job in |queue| on the current stack, with the bookkeeping
+// MicrotaskQueue::RunMicrotasks does around a drain (the job sets its own CPED;
+// the caller's CPED is restored afterwards). Bypasses RunMicrotasks itself so
+// the default queue's suppression and running state aren't touched while the
+// job may be parked on a coroutine.
+static void RunPrivateMicrotaskQueue(Isolate* isolate, MicrotaskQueue* queue) {
+  HandleScope handle_scope(isolate);
+#ifdef V8_ENABLE_CONTINUATION_PRESERVED_EMBEDDER_DATA
+  DirectHandle<Object> outer_embedder_data(
+      isolate->isolate_data()->continuation_preserved_embedder_data(), isolate);
+  isolate->isolate_data()->set_continuation_preserved_embedder_data(
+      ReadOnlyRoots(isolate).undefined_value());
+#endif  // V8_ENABLE_CONTINUATION_PRESERVED_EMBEDDER_DATA
+  {
+    HandleScopeImplementer::EnteredContextRewindScope rewind_scope(
+        isolate->handle_scope_implementer());
+    g_run_next_dispatchable_inline = true;
+    MaybeDirectHandle<Object> result =
+        Execution::TryRunMicrotasks(isolate, queue);
+    USE(result);
+    // Normally consumed by Runtime_DispatchMicrotask before the job starts.
+    g_run_next_dispatchable_inline = false;
+  }
+#ifdef V8_ENABLE_CONTINUATION_PRESERVED_EMBEDDER_DATA
+  isolate->isolate_data()->set_continuation_preserved_embedder_data(
+      *outer_embedder_data);
+#endif  // V8_ENABLE_CONTINUATION_PRESERVED_EMBEDDER_DATA
+  if (isolate->is_execution_terminating()) {
+    isolate->OnTerminationDuringRunMicrotasks();
+  }
+}
+
+RUNTIME_FUNCTION(Runtime_DispatchMicrotask) {
+  HandleScope scope(isolate);
+  DCHECK_EQ(1, args.length());
+  if (g_run_next_dispatchable_inline) {
+    g_run_next_dispatchable_inline = false;
+    return ReadOnlyRoots(isolate).false_value();
+  }
+  if (g_microtask_dispatch_callback == nullptr ||
+      g_microtask_dispatch_isolate != isolate) {
+    return ReadOnlyRoots(isolate).false_value();
+  }
+  DirectHandle<Microtask> microtask = args.at<Microtask>(0);
+  // A private single-job queue keeps the job alive (queues are GC roots) and
+  // lets the job run through the RunMicrotasks builtin.
+  std::unique_ptr<MicrotaskQueue> queue = MicrotaskQueue::New(isolate);
+  queue->EnqueueMicrotask(*microtask);
+  v8::DispatchedMicrotask* task = new v8::DispatchedMicrotask{queue.get()};
+  bool taken = g_microtask_dispatch_callback(
+      reinterpret_cast<v8::Isolate*>(isolate), task, g_microtask_dispatch_data);
+  if (taken) {
+    queue.release();  // Owned (and possibly already freed) by the embedder.
+  } else {
+    delete task;
+  }
+  RETURN_FAILURE_IF_EXCEPTION(isolate);
+  return isolate->heap()->ToBoolean(taken);
+}
+
+}  // namespace internal
+
+void SetMicrotaskDispatchCallback(Isolate* v8_isolate,
+                                  MicrotaskDispatchCallback callback,
+                                  void* data) {
+  internal::g_microtask_dispatch_callback = callback;
+  internal::g_microtask_dispatch_data = data;
+  internal::g_microtask_dispatch_isolate =
+      reinterpret_cast<internal::Isolate*>(v8_isolate);
+}
+
+void RunDispatchedMicrotask(Isolate* v8_isolate, DispatchedMicrotask* task) {
+  internal::Isolate* isolate = reinterpret_cast<internal::Isolate*>(v8_isolate);
+  std::unique_ptr<internal::MicrotaskQueue> queue(task->queue);
+  delete task;
+  internal::RunPrivateMicrotaskQueue(isolate, queue.get());
+}
+
+bool RunNextDispatchableMicrotask(Isolate* v8_isolate) {
+#ifdef V8_ENABLE_CONTINUATION_PRESERVED_EMBEDDER_DATA
+  internal::Isolate* isolate = reinterpret_cast<internal::Isolate*>(v8_isolate);
+  internal::MicrotaskQueue* queue = isolate->default_microtask_queue();
+  if (queue == nullptr || queue->size() == 0) return false;
+  internal::HandleScope handle_scope(isolate);
+  internal::Tagged<internal::Microtask> front = queue->get(0);
+  if (!internal::IsPromiseFulfillReactionJobTask(front) &&
+      !internal::IsPromiseRejectReactionJobTask(front)) {
+    return false;
+  }
+  if (internal::IsUndefined(front->continuation_preserved_embedder_data(),
+                            isolate)) {
+    return false;
+  }
+  internal::DirectHandle<internal::Microtask> microtask(front, isolate);
+  // Take it off the front of the queue the way the RunMicrotasks builtin does
+  // (that loop re-reads start and size before every job, so the drain this is
+  // nested in carries on with the job after it).
+  internal::Address base = reinterpret_cast<internal::Address>(queue);
+  intptr_t* start = reinterpret_cast<intptr_t*>(
+      base + internal::MicrotaskQueue::kStartOffset);
+  intptr_t* size = reinterpret_cast<intptr_t*>(
+      base + internal::MicrotaskQueue::kSizeOffset);
+  *start = (*start + 1) % queue->capacity();
+  *size -= 1;
+  std::unique_ptr<internal::MicrotaskQueue> private_queue =
+      internal::MicrotaskQueue::New(isolate);
+  private_queue->EnqueueMicrotask(*microtask);
+  internal::RunPrivateMicrotaskQueue(isolate, private_queue.get());
+  return true;
+#else
+  return false;
+#endif  // V8_ENABLE_CONTINUATION_PRESERVED_EMBEDDER_DATA
+}
+
+}  // namespace v8
+
+extern "C" {
+void v8_qualia_SetMicrotaskDispatchCallback(
+    v8::Isolate* isolate, v8::MicrotaskDispatchCallback callback, void* data) {
+  v8::SetMicrotaskDispatchCallback(isolate, callback, data);
+}
+
+void v8_qualia_RunDispatchedMicrotask(v8::Isolate* isolate,
+                                      v8::DispatchedMicrotask* task) {
+  v8::RunDispatchedMicrotask(isolate, task);
+}
+
+bool v8_qualia_RunNextDispatchableMicrotask(v8::Isolate* isolate) {
+  return v8::RunNextDispatchableMicrotask(isolate);
+}
+}
+
+namespace v8 {
+namespace internal {
 
 RUNTIME_FUNCTION(Runtime_PromiseHookInit) {
   HandleScope scope(isolate);
