@@ -13,6 +13,7 @@
 #include "src/objects/heap-object-inl.h"
 #include "src/objects/js-promise-inl.h"
 #include "src/objects/microtask-inl.h"
+#include "src/objects/promise-inl.h"
 #include "src/objects/objects-inl.h"
 #include "src/objects/oddball-inl.h"
 #include "src/runtime/runtime-utils.h"
@@ -188,6 +189,40 @@ void RunDispatchedMicrotask(Isolate* v8_isolate, DispatchedMicrotask* task) {
   }
 }
 
+bool RunNextDispatchableMicrotask(Isolate* v8_isolate) {
+  internal::Isolate* isolate = reinterpret_cast<internal::Isolate*>(v8_isolate);
+  internal::MicrotaskQueue* queue = isolate->default_microtask_queue();
+  if (queue == nullptr || queue->size() == 0) return false;
+  internal::HandleScope handle_scope(isolate);
+  internal::Microtask front = queue->get(0);
+  if (!front.IsPromiseFulfillReactionJobTask() &&
+      !front.IsPromiseRejectReactionJobTask()) {
+    return false;
+  }
+  if (internal::PromiseReactionJobTask::cast(front)
+          .continuation_preserved_embedder_data()
+          .IsUndefined(isolate)) {
+    return false;
+  }
+  internal::Handle<internal::Microtask> microtask(front, isolate);
+  // Take it off the front of the queue the way the RunMicrotasks builtin does
+  // (that loop re-reads start and size before every job, so the drain this is
+  // nested in carries on with the job after it).
+  internal::Address base = reinterpret_cast<internal::Address>(queue);
+  intptr_t* start = reinterpret_cast<intptr_t*>(
+      base + internal::MicrotaskQueue::kStartOffset);
+  intptr_t* size = reinterpret_cast<intptr_t*>(
+      base + internal::MicrotaskQueue::kSizeOffset);
+  *start = (*start + 1) % queue->capacity();
+  *size -= 1;
+  std::unique_ptr<internal::MicrotaskQueue> private_queue =
+      internal::MicrotaskQueue::New(isolate);
+  private_queue->EnqueueMicrotask(*microtask);
+  RunDispatchedMicrotask(v8_isolate,
+                         new DispatchedMicrotask{private_queue.release()});
+  return true;
+}
+
 }  // namespace v8
 
 extern "C" {
@@ -199,6 +234,10 @@ void v8_qualia_SetMicrotaskDispatchCallback(
 void v8_qualia_RunDispatchedMicrotask(v8::Isolate* isolate,
                                       v8::DispatchedMicrotask* task) {
   v8::RunDispatchedMicrotask(isolate, task);
+}
+
+bool v8_qualia_RunNextDispatchableMicrotask(v8::Isolate* isolate) {
+  return v8::RunNextDispatchableMicrotask(isolate);
 }
 }
 
