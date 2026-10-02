@@ -39,6 +39,13 @@ class MicrotaskQueueBuiltinsAssembler : public CodeStubAssembler {
   void PrepareForContext(TNode<Context> microtask_context, Label* bailout);
   void RunSingleMicrotask(TNode<Context> current_context,
                           TNode<Microtask> microtask);
+  // Prototype (Qualia): offers a promise reaction job whose continuation-
+  // preserved embedder data is not undefined to the embedder (see
+  // include/v8-microtask-dispatch.h). Jumps to |dispatched| if it took it.
+  void MaybeDispatchPromiseReactionJob(TNode<Context> current_context,
+                                       TNode<Microtask> microtask,
+                                       Label* dispatched, Label* if_exception,
+                                       TVariable<Object>* var_exception);
   void IncrementFinishedMicrotaskCount(TNode<RawPtrT> microtask_queue);
 
   TNode<Context> GetCurrentContext();
@@ -142,6 +149,25 @@ void MicrotaskQueueBuiltinsAssembler::ClearContinuationPreservedEmbedderData() {
 }
 #endif  // V8_ENABLE_CONTINUATION_PRESERVED_EMBEDDER_DATA
 
+void MicrotaskQueueBuiltinsAssembler::MaybeDispatchPromiseReactionJob(
+    TNode<Context> current_context, TNode<Microtask> microtask,
+    Label* dispatched, Label* if_exception, TVariable<Object>* var_exception) {
+#ifdef V8_ENABLE_CONTINUATION_PRESERVED_EMBEDDER_DATA
+  Label run_inline(this);
+  const TNode<Object> continuation_preserved_embedder_data = LoadObjectField(
+      microtask, Microtask::kContinuationPreservedEmbedderDataOffset);
+  GotoIf(IsUndefined(continuation_preserved_embedder_data), &run_inline);
+  TNode<Object> result;
+  {
+    ScopedExceptionHandler handler(this, if_exception, var_exception);
+    result = CallRuntime(Runtime::kDispatchMicrotask, current_context,
+                         microtask);
+  }
+  Branch(TaggedEqual(result, TrueConstant()), dispatched, &run_inline);
+  BIND(&run_inline);
+#endif  // V8_ENABLE_CONTINUATION_PRESERVED_EMBEDDER_DATA
+}
+
 void MicrotaskQueueBuiltinsAssembler::RunSingleMicrotask(
     TNode<Context> current_context, TNode<Microtask> microtask) {
   CSA_DCHECK(this, TaggedIsNotSmi(microtask));
@@ -158,7 +184,8 @@ void MicrotaskQueueBuiltinsAssembler::RunSingleMicrotask(
       is_promise_fulfill_reaction_job(this),
       is_promise_reject_reaction_job(this),
       is_promise_resolve_thenable_job(this),
-      is_unreachable(this, Label::kDeferred), done(this);
+      is_unreachable(this, Label::kDeferred), done(this),
+      job_dispatched(this, Label::kDeferred);
 
   int32_t case_values[] = {CALLABLE_TASK_TYPE, CALLBACK_TASK_TYPE,
                            PROMISE_FULFILL_REACTION_JOB_TASK_TYPE,
@@ -270,6 +297,9 @@ void MicrotaskQueueBuiltinsAssembler::RunSingleMicrotask(
     TNode<Context> microtask_context = LoadObjectField<Context>(
         microtask, PromiseReactionJobTask::kContextOffset);
     TNode<NativeContext> native_context = LoadNativeContext(microtask_context);
+    MaybeDispatchPromiseReactionJob(current_context, microtask,
+                                    &job_dispatched, &if_exception,
+                                    &var_exception);
     PrepareForContext(native_context, &done);
 
     const TNode<Object> argument =
@@ -312,6 +342,9 @@ void MicrotaskQueueBuiltinsAssembler::RunSingleMicrotask(
     TNode<Context> microtask_context = LoadObjectField<Context>(
         microtask, PromiseReactionJobTask::kContextOffset);
     TNode<NativeContext> native_context = LoadNativeContext(microtask_context);
+    MaybeDispatchPromiseReactionJob(current_context, microtask,
+                                    &job_dispatched, &if_exception,
+                                    &var_exception);
     PrepareForContext(native_context, &done);
 
     const TNode<Object> argument =
@@ -350,6 +383,14 @@ void MicrotaskQueueBuiltinsAssembler::RunSingleMicrotask(
 
   BIND(&is_unreachable);
   Unreachable();
+
+  BIND(&job_dispatched);
+  {
+    // The embedder ran (or will run) the job elsewhere.
+    RewindEnteredContext(saved_entered_context_count);
+    SetCurrentContext(current_context);
+    Goto(&done);
+  }
 
   BIND(&if_exception);
   {
