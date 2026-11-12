@@ -39,6 +39,13 @@ class MicrotaskQueueBuiltinsAssembler : public CodeStubAssembler {
   void PrepareForContext(TNode<Context> microtask_context, Label* bailout);
   void RunSingleMicrotask(TNode<Context> current_context,
                           TNode<Microtask> microtask);
+  // Prototype (Qualia): offers a promise reaction job whose continuation-
+  // preserved embedder data is not undefined to the embedder (see
+  // include/v8-microtask-dispatch.h). Jumps to |dispatched| if it took it.
+  void MaybeDispatchPromiseReactionJob(TNode<Context> current_context,
+                                       TNode<NativeContext> microtask_context,
+                                       TNode<Microtask> microtask,
+                                       Label* dispatched);
   void IncrementFinishedMicrotaskCount(TNode<RawPtrT> microtask_queue);
 
   TNode<Context> GetCurrentContext();
@@ -141,6 +148,36 @@ void MicrotaskQueueBuiltinsAssembler::ClearContinuationPreservedEmbedderData() {
   SetContinuationPreservedEmbedderData(UndefinedConstant());
 }
 #endif  // V8_ENABLE_CONTINUATION_PRESERVED_EMBEDDER_DATA
+
+void MicrotaskQueueBuiltinsAssembler::MaybeDispatchPromiseReactionJob(
+    TNode<Context> current_context, TNode<NativeContext> microtask_context,
+    TNode<Microtask> microtask, Label* dispatched) {
+#ifdef V8_ENABLE_CONTINUATION_PRESERVED_EMBEDDER_DATA
+  Label run_inline(this);
+  const TNode<Object> continuation_preserved_embedder_data = LoadObjectField(
+      microtask, offsetof(Microtask, continuation_preserved_embedder_data_));
+  GotoIf(IsUndefined(continuation_preserved_embedder_data), &run_inline);
+  TVARIABLE(Object, var_exception);
+  Label if_exception(this, Label::kDeferred);
+  TNode<Object> result;
+  {
+    ScopedExceptionHandler handler(this, &if_exception, &var_exception);
+    result =
+        CallRuntime(Runtime::kDispatchMicrotask, current_context, microtask);
+  }
+  Branch(TaggedEqual(result, TrueConstant()), dispatched, &run_inline);
+
+  BIND(&if_exception);
+  {
+    // The dispatch callback threw: report it like an exception from the job.
+    CallRuntime(Runtime::kReportMessageFromMicrotask, microtask_context,
+                var_exception.value());
+    Goto(dispatched);
+  }
+
+  BIND(&run_inline);
+#endif  // V8_ENABLE_CONTINUATION_PRESERVED_EMBEDDER_DATA
+}
 
 void MicrotaskQueueBuiltinsAssembler::RunSingleMicrotask(
     TNode<Context> current_context, TNode<Microtask> microtask) {
@@ -305,6 +342,9 @@ void MicrotaskQueueBuiltinsAssembler::RunSingleMicrotask(
     TNode<NativeContext> microtask_context =
         LoadNativeContext(LoadObjectField<Context>(
             microtask, offsetof(PromiseReactionJobTask, context_)));
+    MaybeDispatchPromiseReactionJob(current_context, microtask_context,
+                                    microtask,
+                                    &rewind_entered_context_and_done);
     PrepareForContext(microtask_context, &done);
 
     const TNode<Object> argument =
@@ -355,6 +395,9 @@ void MicrotaskQueueBuiltinsAssembler::RunSingleMicrotask(
     TNode<NativeContext> microtask_context =
         LoadNativeContext(LoadObjectField<Context>(
             microtask, offsetof(PromiseReactionJobTask, context_)));
+    MaybeDispatchPromiseReactionJob(current_context, microtask_context,
+                                    microtask,
+                                    &rewind_entered_context_and_done);
     PrepareForContext(microtask_context, &done);
 
     const TNode<Object> argument =
